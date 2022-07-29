@@ -1,32 +1,34 @@
 package org.myorg.quickstart;
 
-import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.api.common.functions.GroupReduceFunction;
-import org.apache.flink.api.common.functions.JoinFunction;
 import org.apache.flink.api.common.functions.MapFunction;
-import org.apache.flink.api.common.operators.Order;
 import org.apache.flink.api.java.DataSet;
 import org.apache.flink.api.java.ExecutionEnvironment;
 import org.apache.flink.api.java.functions.KeySelector;
+import org.apache.flink.api.java.operators.JoinOperator;
+import org.apache.flink.api.java.operators.UnsortedGrouping;
 import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.util.Collector;
+import org.myorg.quickstart.function.GenreRatingCollectorFunction;
+import org.myorg.quickstart.function.MovieAndRatingJoinFunction;
+import org.myorg.quickstart.function.MovieRatingGenreSplitterFunction;
 import org.myorg.quickstart.model.GenreRating;
 import org.myorg.quickstart.model.Movie;
 import org.myorg.quickstart.model.MovieRating;
 import org.myorg.quickstart.model.Rating;
 import org.myorg.quickstart.model.enums.Genre;
 
-import java.util.Collections;
 import java.util.List;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import java.util.stream.Collectors;
 
 public class MovieRatingService {
+    private static final Logger LOG = Logger.getLogger(MovieRatingService.class.getName());
+
     private static final String RESOURCES_DIR = "src/main/resources/";
 
-    public static void main(String[] args) throws Exception {
-        final ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
-
-        /*
+    /*
         Get Distinct Genre using
 
         env.readCsvFile(RESOURCES_DIR + "ml-latest-small/movies.csv")
@@ -46,8 +48,9 @@ public class MovieRatingService {
                 .map(a -> a.f0)
                 .print();
 
-        */
-
+    */
+    public static void main(String[] args) throws Exception {
+        final ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
         DataSet<Movie> movies = env.readCsvFile(RESOURCES_DIR + "ml-latest-small/movies.csv")
                 .ignoreFirstLine()
                 .ignoreInvalidLines()
@@ -75,67 +78,76 @@ public class MovieRatingService {
                     }
                 });
 
-        List<GenreRating> sortedGenreRating = movies.join(rating)
-                .where(new KeySelector<Movie, Long>() {
-                    @Override
-                    public Long getKey(Movie movie) throws Exception {
-                        return movie.getId();
-                    }
-                })
-                .equalTo(new KeySelector<Rating, Long>() {
-                    @Override
-                    public Long getKey(Rating rating) throws Exception {
-                        return rating.getMovieId();
-                    }
-                })
-                .with(new JoinFunction<Movie, Rating, MovieRating>() {
-                    @Override
-                    public MovieRating join(Movie movie, Rating rating) throws Exception {
-                        return new MovieRating(movie.getName(), movie.getGenres(), rating.getRating());
-                    }
-                })
-                .flatMap(new FlatMapFunction<MovieRating, MovieRating>() {
-                    @Override
-                    public void flatMap(MovieRating movieRating, Collector<MovieRating> collector) throws Exception {
-                        for (Genre genre : movieRating.getGenres()) {
-                            collector.collect(new MovieRating(movieRating.getName(), Collections.singletonList(genre), movieRating.getRating()));
-                        }
-                    }
-                })
-                .groupBy(new KeySelector<MovieRating, Genre>() {
-                    @Override
-                    public Genre getKey(MovieRating movieRating) throws Exception {
-                        return movieRating.getGenres().get(0);
-                    }
-                })
-                .reduceGroup(new GroupReduceFunction<MovieRating, GenreRating>() {
-                    @Override
-                    public void reduce(Iterable<MovieRating> iterable, Collector<GenreRating> collector) throws Exception {
-                        Genre genre = null;
+        DataSet<MovieRating> movieRating = getMovieRatingDataset(movies, rating);
 
-                        int count = 0;
-                        double totalRating = 0;
+        UnsortedGrouping<MovieRating> groupedByGenre = getGroupByGenre(movieRating);
+
+        GenreRating highestRatedGenre = getHighestRatedGenre(groupedByGenre);
+
+        LOG.info("=====> ");
+        LOG.log(Level.INFO, "Highest Rated Genre {0}", highestRatedGenre);
+
+        List<MovieRating> highestRatedMoviePerGenre = getHighestRatedMoviePerGenre(groupedByGenre);
+
+        LOG.info("=====> ");
+        LOG.log(Level.INFO, "Highest Rated Movie Per Genre {0}", highestRatedMoviePerGenre);
+    }
+
+    private static List<MovieRating> getHighestRatedMoviePerGenre(UnsortedGrouping<MovieRating> groupedByGenre) throws Exception {
+        return groupedByGenre
+                .reduceGroup(new GroupReduceFunction<MovieRating, MovieRating>() {
+                    @Override
+                    public void reduce(Iterable<MovieRating> iterable, Collector<MovieRating> collector) throws Exception {
+                        double highestRating = 0.0d;
+                        MovieRating rating = null;
 
                         for (MovieRating movieRating : iterable) {
-                            genre = movieRating.getGenres().get(0);
-                            count++;
-                            totalRating += movieRating.getRating();
+                            if (highestRating < movieRating.getRating()) {
+                                highestRating = movieRating.getRating();
+                                rating = movieRating;
+                            }
                         }
 
-                        collector.collect(new GenreRating(genre, count, totalRating, totalRating / count));
+                        collector.collect(rating);
                     }
                 })
+                .name("Highest Rated Movie Per Genre Function")
+                .collect();
+    }
+
+    private static GenreRating getHighestRatedGenre(UnsortedGrouping<MovieRating> groupedByGenre) throws Exception {
+        return groupedByGenre
+                // reduce to count, averageRating of each Genre
+                .reduceGroup(new GenreRatingCollectorFunction())
+                .name("Genre Rating Function")
                 /*.sortPartition(new KeySelector<GenreRating, Double>() {
                     @Override
                     public Double getKey(GenreRating genreRating) throws Exception {
                         return genreRating.getAverageRating();
                     }
                 }, Order.DESCENDING)*/
+                // Collect as Java List to sort in-memory
                 .collect()
                 .stream().sorted((a, b) -> Double.compare(b.getAverageRating(), a.getAverageRating()))
-                .collect(Collectors.toList());
+                .collect(Collectors.toList()).get(0);
+    }
 
-        System.out.println("Sorted Genre Rating " + sortedGenreRating);
+    private static UnsortedGrouping<MovieRating> getGroupByGenre(DataSet<MovieRating> movieRating) {
+        UnsortedGrouping<MovieRating> groupedByGenre = movieRating
+                // Split one MovieRating into multiple, based on individual genres
+                .flatMap(new MovieRatingGenreSplitterFunction())
+                .name("MovieRating Genre Split Function")
+                // Group by Genre
+                .groupBy((KeySelector<MovieRating, Genre>) element -> element.getGenres().get(0));
+        return groupedByGenre;
+    }
 
+    private static JoinOperator<Movie, Rating, MovieRating> getMovieRatingDataset(DataSet<Movie> movies, DataSet<Rating> rating) {
+        return movies.join(rating)
+                // Join movie and rating on movieId
+                .where(Movie::getId)
+                .equalTo(Rating::getMovieId)
+                .with(new MovieAndRatingJoinFunction())
+                .name("Movie and Rating Join Function");
     }
 }
